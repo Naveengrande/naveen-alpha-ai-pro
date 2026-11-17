@@ -36,6 +36,30 @@ function cleanAttachments(raw: unknown): Attachment[] {
   return out;
 }
 
+/** Keep only the most recent messages that fit within maxChars (the last message is always kept, truncated if needed). */
+function fitMessages(msgs: ProviderMessage[], maxChars: number): ProviderMessage[] {
+  const size = (m: ProviderMessage) => m.content.length + (m.attachments ?? []).reduce((n, a) => n + (a.text?.length ?? 0), 0);
+  const out: ProviderMessage[] = [];
+  let used = 0;
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    const sz = size(msgs[i]);
+    if (out.length && used + sz > maxChars) break;
+    out.unshift(msgs[i]);
+    used += sz;
+  }
+  // Drop leading assistant turns so the history starts with a user message.
+  while (out.length > 1 && out[0].role === "assistant") out.shift();
+  if (out.length === 1 && size(out[0]) > maxChars) {
+    const m = out[0];
+    out[0] = { ...m, content: m.content.slice(0, Math.max(0, maxChars - 200)) + "\n\n[Message shortened to fit this model's free-tier limit.]", attachments: m.attachments?.map((a) => ({ ...a, text: a.text ? a.text.slice(0, Math.max(0, maxChars - 200)) : a.text })) };
+  }
+  return out;
+}
+
+// Free tiers limit tokens per minute (Groq: 8,000). Keep each request small enough to fit.
+const MAX_OUTPUT_TOKENS = Math.max(256, Number(process.env.NAVEEN_MAX_OUTPUT_TOKENS) || 3000);
+const GROQ_CONTEXT_CHARS = Math.max(2000, Number(process.env.NAVEEN_GROQ_CONTEXT_CHARS) || 12000);
+
 export async function POST(req: NextRequest) {
   const rl = rateLimit(`chat:${clientIp(req)}`);
   if (!rl.ok) return json(429, { error: `Rate limit reached. Try again in ${rl.retryAfter}s.` }, { "Retry-After": String(rl.retryAfter) });
@@ -107,8 +131,9 @@ export async function POST(req: NextRequest) {
             for await (const delta of cand.provider.stream({
               model: cand.model,
               system,
-              messages,
+              messages: cand.provider.id === "groq" ? fitMessages(messages, GROQ_CONTEXT_CHARS) : messages,
               temperature,
+              maxTokens: MAX_OUTPUT_TOKENS,
               signal: req.signal,
             })) {
               started = true;
@@ -119,7 +144,7 @@ export async function POST(req: NextRequest) {
           } catch (e) {
             if (req.signal.aborted) break;
             const status = e instanceof ProviderError ? e.status : 500;
-            const retryable = status === 403 || status === 404 || status === 408 || status === 429 || status >= 500;
+            const retryable = status === 403 || status === 404 || status === 408 || status === 413 || status === 429 || status >= 500;
             // Fail over only if nothing has been shown yet and a backup exists.
             if (!started && retryable && i < chain.length - 1) {
               console.error(`provider ${cand.provider.id} failed (${status}), trying backup`);
